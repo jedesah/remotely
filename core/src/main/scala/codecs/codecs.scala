@@ -22,6 +22,7 @@ import scala.math.Ordering
 import scala.reflect.runtime.universe.TypeTag
 import scalaz.{\/,-\/,\/-,Monad}
 import scalaz.\/._
+import scalaz.stream.Process
 import scalaz.concurrent.Task
 import scalaz.syntax.std.option._
 import scodec.{Codec,codecs => C,Decoder,Encoder}
@@ -122,24 +123,29 @@ package object codecs extends lowerprioritycodecs with TupleHelpers {
              catch { case e: IllegalArgumentException => fail(Err(s"[decoding] error decoding ID in tracing stack: ${e.getMessage}")) }
   } yield Response.Context(header, stack)
 
-  def remoteEncode[A](r: Remote[A]): Err \/ BitVector =
+  def remoteEncode[A](r: Remote[A]): Process[Task,Err \/ BitVector] =
     r match {
-      case Local(a,e,t) => C.uint8.encode(0) <+> // tag byte
-        utf8.encode(t) <+>
-        e.asInstanceOf[Option[Encoder[A]]].map(_.encode(a))
-          .getOrElse(left(Err("cannot encode Local value with undefined encoder")))
+      case Local(a,encoder,t) => Process.emit(C.uint8.encode(0)) ++ // tag byte
+        Process.emit(utf8.encode(t) <+>
+        encoder.asInstanceOf[Option[Encoder[A]]].map(_.encode(a))
+          .getOrElse(left(Err("cannot encode Local value with undefined encoder"))))
       case Async(a,e,t) =>
-        left(Err("cannot encode Async constructor; call Remote.localize first"))
-      case Ref(t) => C.uint8.encode(1) <+>
-        utf8.encode(t)
-      case Ap1(f,a) => C.uint8.encode(2) <+>
-        remoteEncode(f) <+> remoteEncode(a)
-      case Ap2(f,a,b) => C.uint8.encode(3) <+>
-        remoteEncode(f) <+> remoteEncode(a) <+> remoteEncode(b)
-      case Ap3(f,a,b,c) => C.uint8.encode(4) <+>
-        remoteEncode(f) <+> remoteEncode(a) <+> remoteEncode(b) <+> remoteEncode(c)
-      case Ap4(f,a,b,c,d) => C.uint8.encode(5) <+>
-        remoteEncode(f) <+> remoteEncode(a) <+> remoteEncode(b) <+> remoteEncode(c) <+> remoteEncode(d)
+        Process.emit(left(Err("cannot encode Async constructor; call Remote.localize first")))
+      case Ref(t) => Process.emit(C.uint8.encode(1)) ++
+        Process.emit(utf8.encode(t))
+      case Ap1(f,a) => Process.emit(C.uint8.encode(2)) ++
+        remoteEncode(f) ++ remoteEncode(a)
+        // Anything but Ap1 will never see a Stream
+      case Ap2(f,a,b) => Process.emit(C.uint8.encode(3)) ++
+        remoteEncode(f) ++ remoteEncode(a) ++ remoteEncode(b)
+      case Ap3(f,a,b,c) => Process.emit(C.uint8.encode(4)) ++
+        remoteEncode(f) ++ remoteEncode(a) ++ remoteEncode(b) ++ remoteEncode(c)
+      case Ap4(f,a,b,c,d) => Process.emit(C.uint8.encode(5)) ++
+        remoteEncode(f) ++ remoteEncode(a) ++ remoteEncode(b) ++ remoteEncode(c) ++ remoteEncode(d)
+      case LocalStream(stream,encoder, tag) => Process.emit(C.uint8.encode(6)) ++
+        stream.map(elem => encoder.map(_.encode(elem)).getOrElse(
+          left(Err("cannot encode Local value with undefined encoder"))
+        ))
     }
 
   private val E = Monad[Decoder]
@@ -173,9 +179,6 @@ package object codecs extends lowerprioritycodecs with TupleHelpers {
     }
   }
 
-  implicit def remoteEncoder[A]: Encoder[Remote[A]] =
-    new Encoder[Remote[A]] { def encode(a: Remote[A]) = remoteEncode(a) }
-
   /**
    * Wait for all `Async` tasks to complete, then encode
    * the remaining concrete expression. The produced
@@ -187,13 +190,13 @@ package object codecs extends lowerprioritycodecs with TupleHelpers {
    * Use `encode(r).map(_.toByteArray)` to produce a `Task[Array[Byte]]`.
    */
   def encodeRequest[A:TypeTag](a: Remote[A]): Response[BitVector] = Response { ctx =>
-    Codec[String].encode(Remote.toTag[A]) <+>
+    Process.emit(Codec[String].encode(Remote.toTag[A]) <+>
     Encoder[Response.Context].encode(ctx) <+>
-    sortedSet[String].encode(formats(a))  <+>
-    remoteEncode(a) fold (
-      err => Task.fail(new EncodingFailure(err)),
-      bits => Task.now(bits)
-    )
+    sortedSet[String].encode(formats(a))) ++
+    remoteEncode(a) flatMap {
+      case -\/(err) => Process.fail(new EncodingFailure(err))
+      case \/-(bitVector) => Process.emit(bitVector)
+    }
   }
 
   def requestDecoder(env: Environment): Decoder[(Encoder[Any],Response.Context,Remote[Any])] =

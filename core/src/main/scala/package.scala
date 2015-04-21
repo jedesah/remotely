@@ -1,3 +1,5 @@
+import scalaz.Nondeterminism
+
 //: ----------------------------------------------------------------------------
 //: Copyright (C) 2014 Verizon.  All Rights Reserved.
 //:
@@ -42,6 +44,11 @@ package object remotely {
   */
   type Handler = Process[Task,BitVector] => Process[Task,BitVector]
 
+  def evaluateStream[A:Decoder:TypeTag](e: Endpoint, M: Monitoring = Monitoring.empty)(r: Remote[Process[Task, A]]): Response[A] = {
+    // TODO: Factor out common code with evalute
+    ???
+  }
+
   /**
    * Evaluate the given remote expression at the
    * specified endpoint, and get back the result.
@@ -62,35 +69,39 @@ package object remotely {
         }
         case None => Task.now(())
       }
-                                                      
-    Task.delay { System.nanoTime } flatMap { start =>
+
+    val startTime = Task.delay { System.nanoTime() }
+    Process.await(startTime.flatMap(start => e.get.map(conn => (start,conn)))) { case (start, conn) =>
+      val reqBits = codecs.encodeRequest(r).apply(ctx)
+      val respBytes = reportErrors(start) {
+        // Reads all the bits one shot.
+        // This also needs to change :-)
+        val bytes = fullyRead(conn(reqBits))
+        bytes
+      }
       for {
-        conn <- e.get
-        reqBits <- codecs.encodeRequest(r).apply(ctx)
-        respBytes <- reportErrors(start) {
-          val reqBytestream = Process.emit(reqBits)
-          val bytes = fullyRead(conn(reqBytestream))
-          bytes
-        }
         resp <- {
-          reportErrors(start) { codecs.liftDecode(codecs.responseDecoder[A].decode(respBytes/*._1*/)) }
+          reportErrors(start) {
+            codecs.liftDecode(codecs.responseDecoder[A].decode(respBytes /*._1*/))
+          }
         }
         result <- resp.fold(
-          { e =>
-            val ex = ServerException("error decoding response: " + e)
-            val delta = System.nanoTime - start
-            M.handled(ctx, r, Remote.refs(r), left(ex), Duration.fromNanos(delta))
-            Task.fail(ex)
-          },
-          { a =>
-            val delta = System.nanoTime - start
-            M.handled(ctx, r, refs, right(a), Duration.fromNanos(delta))
-            Task.now(a)
-          }
+        { e =>
+          val ex = ServerException("error decoding response: " + e)
+          val delta = System.nanoTime - start
+          M.handled(ctx, r, Remote.refs(r), left(ex), Duration.fromNanos(delta))
+          Task.fail(ex)
+        }, { a =>
+          val delta = System.nanoTime - start
+          M.handled(ctx, r, refs, right(a), Duration.fromNanos(delta))
+          Task.now(a)
+        }
         )
       } yield result
     }
-  }}}
+    ???
+    }
+  }}
 
   implicit val BitVectorMonoid = Monoid.instance[BitVector]((a,b) => a ++ b, BitVector.empty)
   implicit val ByteVectorMonoid = Monoid.instance[ByteVector]((a,b) => a ++ b, ByteVector.empty)
