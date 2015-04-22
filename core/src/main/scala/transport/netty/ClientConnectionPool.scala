@@ -31,6 +31,7 @@ import io.netty.channel.{Channel, ChannelFuture, ChannelFutureListener,ChannelHa
 import io.netty.channel.socket.nio.NioSocketChannel
 import io.netty.handler.codec.{Delimiters,DelimiterBasedFrameDecoder}
 import io.netty.handler.ssl.SslContext
+import scala.util.{Success, Failure, Try}
 import scalaz.concurrent.Task
 import scalaz.stream.Process
 import scalaz.{-\/,\/,\/-}
@@ -145,8 +146,8 @@ class NettyConnectionPool(hosts: Process[Task,InetSocketAddress],
           bits = bits ++ bv
         case EOS =>
           M.negotiating(Some(addr), "got end of description response", None)
-          val run: Task[Unit] = for {
-            resp <- codecs.liftDecode(codecs.responseDecoder[List[Signature]](codecs.list(Signature.signatureCodec)).decode(bits))
+          val signatureDecoding: Try[Unit] = for {
+            resp <- codecs.failOnClientDecodeProblem(codecs.responseDecoder[List[Signature]](codecs.list(Signature.signatureCodec)).decode(bits))
           }  yield resp.fold(e => fail(s"error processing description response: $e"),
                              serverSigs => {
                                val missing = (expectedSigs -- serverSigs)
@@ -156,9 +157,9 @@ class NettyConnectionPool(hosts: Process[Task,InetSocketAddress],
                                  fail(s"server is missing required signatures: ${missing.map(_.tag)}}")
                                }
                              })
-          run.runAsync {
-            case -\/(e) => M.negotiating(Some(addr), "error processing description", Some(e))
-            case \/-(_) => M.negotiating(Some(addr), "finmshed processing response", None)
+          signatureDecoding match {
+            case Failure(e) => M.negotiating(Some(addr), "error processing description", Some(e))
+            case Success(_) => M.negotiating(Some(addr), "finmshed processing response", None)
           }
       }
     }
@@ -176,7 +177,7 @@ class NettyConnectionPool(hosts: Process[Task,InetSocketAddress],
       * description of server supported functions
       */
     private[this] val requestDescription: Task[Unit] = for {
-      bits <- codecs.encodeRequest(Remote.ref[List[Signature]]("describe")).apply(Response.Context.empty)
+      bits <- codecs.encodeRequest(Remote.ref[List[Signature]]("describe")).apply(Response.Context.empty).runLast.map(_.get)
       _ <- NettyTransport.evalCF(channel.write(Bits(bits)))
       _ <- NettyTransport.evalCF(channel.writeAndFlush(EOS))
       _ = M.negotiating(Some(addr), "sending describe request", None)

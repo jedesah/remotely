@@ -20,6 +20,7 @@ package remotely
 import scala.collection.immutable.{IndexedSeq,Set,SortedMap,SortedSet}
 import scala.math.Ordering
 import scala.reflect.runtime.universe.TypeTag
+import scala.util.{Failure, Success, Try}
 import scalaz.{\/,-\/,\/-,Monad}
 import scalaz.\/._
 import scalaz.stream.Process
@@ -199,6 +200,19 @@ package object codecs extends lowerprioritycodecs with TupleHelpers {
     }
   }
 
+  def decodeResponse[A: Decoder](resp: Process[Task, BitVector]): Process[Task, String \/ A] = {
+    import remotely.utils._
+    val rawDecoded: Process[Task, Err \/ (BitVector, String \/ A)] = resp.map(bits=> responseDecoder[A].decode(bits))
+    val decodedWithFail = rawDecoded.map(failOnClientDecodeProblem(_))
+    decodedWithFail.flatten
+  }
+
+  def failOnClientDecodeProblem[A](response: Err \/ (BitVector, A)): Try[A] =
+    for {
+      response1 <- failOnClientDecodeErr(response)
+      response2 <- failOnTrailingBits(response1)
+    } yield response2
+
   def requestDecoder(env: Environment): Decoder[(Encoder[Any],Response.Context,Remote[Any])] =
     for {
       responseTag <- utf8
@@ -234,21 +248,23 @@ package object codecs extends lowerprioritycodecs with TupleHelpers {
 
   def succeed[A](a: A): Decoder[A] = C.provide(a)
 
-  def decodeTask[A:Decoder](bits: BitVector): Task[A] =
-    liftDecode(Decoder[A].decode(bits))
-
   def liftEncode(result: Err \/ BitVector): Task[BitVector] =
     result.fold(
       e => Task.fail(new EncodingFailure(e)),
       bits => Task.now(bits)
     )
-  def liftDecode[A](result: Err \/ (BitVector,A)): Task[A] =
-    result.fold(
-      e => Task.fail(new DecodingFailure(e)),
-      { case (trailing,a) =>
-        if (trailing.isEmpty) Task.now(a)
-        else Task.fail(new DecodingFailure(Err("trailing bits: " + trailing))) }
+  def failOnClientDecodeErr[A](decoded: Err \/ A): Try[A] = {
+    decoded.fold(
+      e => Failure(new DecodingFailure(e)),
+      a => Success(a)
     )
+  }
+  def failOnTrailingBits[A](bitsAndA: (BitVector,A)): Try[A] =
+    bitsAndA match {
+      case (trailing,a) =>
+        if (trailing.isEmpty) Success(a)
+        else Failure(new DecodingFailure(Err("trailing bits: " + trailing)))
+    }
 }
 
 trait TupleHelpers {
