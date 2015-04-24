@@ -36,17 +36,13 @@ object Server {
    * use the `monitoring` argument if you wish to observe
    * these failures.
    */
-  def handle(env: Environment)(request: BitVector)(monitoring: Monitoring): Task[BitVector] = {
-
-    Task.delay(System.nanoTime).flatMap { startNanos => Task.suspend {
-      // decode the request from the environment
-                                           val (trailing, (respEncoder,ctx,r)) =
-
-                                           codecs.requestDecoder(env).decode(request)
-              .fold(e => throw new Error(e.messageWithContext), identity)
+  def handle(env: Environment)(request: Process[Task, BitVector])(monitoring: Monitoring): Process[Task, BitVector] = {
+    val timeAndHeader = Task.delay(System.nanoTime).flatMap(time => codecs.decodeRequest(env)(request)).map(a => (time, a))
+    Process.await(timeAndHeader) { case (startNanos, request) =>
       val expected = Remote.refs(r)
       val unknown = (expected -- env.values.keySet).toList
-      if (unknown.nonEmpty) { // fail fast if the Environment doesn't know about some referenced values
+      if (unknown.nonEmpty) {
+        // fail fast if the Environment doesn't know about some referenced values
         val missing = unknown.mkString("\n")
         fail(s"[validation] server values: <" + env.values.keySet + s"> does not have referenced values:\n $missing")
       } else if (trailing.nonEmpty) // also fail fast if the request has trailing bits (usually a codec error)
@@ -54,11 +50,11 @@ object Server {
       else // we are good to try executing the request
         eval(env.values)(r)(ctx).flatMap {
           a =>
-          val deltaNanos = System.nanoTime - startNanos
-          val delta = Duration.fromNanos(deltaNanos)
-          val result = right(a)
-          monitoring.handled(ctx, r, expected, result, delta)
-          toTask(codecs.responseEncoder(respEncoder).encode(result))
+            val deltaNanos = System.nanoTime - startNanos
+            val delta = Duration.fromNanos(deltaNanos)
+            val result = right(a)
+            monitoring.handled(ctx, r, expected, result, delta)
+            toTask(codecs.responseEncoder(respEncoder).encode(result))
         }.attempt.flatMap {
           // this is a little convoluted - we catch this exception just so
           // we can log the failure using `monitoring`, then reraise it
@@ -72,29 +68,32 @@ object Server {
             bits => Task.now(bits)
           )
         }
-    }}.attempt.flatMap { _.fold(
+    }
+  }.attempt.flatMap {
+    _.fold(
       e => toTask(codecs.responseEncoder(codecs.utf8).encode(left(Err(formatThrowable(e))))),
       bits => Task.now(bits)
-                        )}
+    )
   }
 
   val P = Process
 
   /** Evaluate a remote expression, using the given (untyped) environment. */
-  def eval[A](env: Values)(r: Remote[A]): Response[A] = {
+  def eval(env: Values)(r: Remote[Any]): Response[Any] = {
     import Remote._
     r match {
       case Async(a, _, _) => a
       case Local(a,_,_) => Response.now(a)
+      case LocalStream(stream, format,tag) => Response.stream(stream)
       case Ref(name) => env.values.lift(name) match {
         case None => Response.delay { sys.error("Unknown name on server: " + name) }
-        case Some(a) => a().asInstanceOf[Response[A]]
+        case Some(a) => a()
       }
       // on the server, only concern ourselves w/ tree of fully saturated calls
-      case Ap1(Ref(f),a) => env.values(f)(eval(env)(a)) .asInstanceOf[Response[A]]
-      case Ap2(Ref(f),a,b) => env.values(f)(eval(env)(a), eval(env)(b)) .asInstanceOf[Response[A]]
-      case Ap3(Ref(f),a,b,c) => env.values(f)(eval(env)(a), eval(env)(b), eval(env)(c)) .asInstanceOf[Response[A]]
-      case Ap4(Ref(f),a,b,c,d) => env.values(f)(eval(env)(a), eval(env)(b), eval(env)(c), eval(env)(d)) .asInstanceOf[Response[A]]
+      case Ap1(Ref(f),a) => env.values(f)(eval(env)(a))
+      case Ap2(Ref(f),a,b) => env.values(f)(eval(env)(a), eval(env)(b))
+      case Ap3(Ref(f),a,b,c) => env.values(f)(eval(env)(a), eval(env)(b), eval(env)(c))
+      case Ap4(Ref(f),a,b,c,d) => env.values(f)(eval(env)(a), eval(env)(b), eval(env)(c), eval(env)(d))
       case _ => Response.delay { sys.error("unable to interpret remote expression of form: " + r) }
     }
   }

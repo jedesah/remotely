@@ -21,7 +21,7 @@ import scala.collection.immutable.{IndexedSeq,Set,SortedMap,SortedSet}
 import scala.math.Ordering
 import scala.reflect.runtime.universe.TypeTag
 import scala.util.{Failure, Success, Try}
-import scalaz.{\/,-\/,\/-,Monad}
+import scalaz._
 import scalaz.\/._
 import scalaz.stream.Process
 import scalaz.concurrent.Task
@@ -30,6 +30,8 @@ import scodec.{Codec,codecs => C,Decoder,Encoder}
 import scodec.bits.BitVector
 import Remote._
 import scodec.Err
+
+import remotely.utils._
 
 private[remotely] trait lowerprioritycodecs {
 
@@ -124,16 +126,12 @@ package object codecs extends lowerprioritycodecs with TupleHelpers {
              catch { case e: IllegalArgumentException => fail(Err(s"[decoding] error decoding ID in tracing stack: ${e.getMessage}")) }
   } yield Response.Context(header, stack)
 
-  def remoteEncode[A](r: Remote[A]): Process[Task,Err \/ BitVector] =
+  def remoteEncode(r: Remote[Any]): Process[Task,Err \/ BitVector] =
     r match {
-      case Local(a,encoder,t) => Process.emit(C.uint8.encode(0)) ++ // tag byte
-        Process.emit(utf8.encode(t) <+>
-        encoder.asInstanceOf[Option[Encoder[A]]].map(_.encode(a))
-          .getOrElse(left(Err("cannot encode Local value with undefined encoder"))))
+      case l: Local[Any]@unchecked => Process(C.uint8.encode(0), localRemoteEncoder.encode(l))
       case Async(a,e,t) =>
         Process.emit(left(Err("cannot encode Async constructor; call Remote.localize first")))
-      case Ref(t) => Process.emit(C.uint8.encode(1)) ++
-        Process.emit(utf8.encode(t))
+      case ref: Ref[Any]@unchecked => Process(C.uint8.encode(1), refCodec.encode(ref))
       case Ap1(f,a) => Process.emit(C.uint8.encode(2)) ++
         remoteEncode(f) ++ remoteEncode(a)
         // Anything but Ap1 will never see a Stream
@@ -143,41 +141,100 @@ package object codecs extends lowerprioritycodecs with TupleHelpers {
         remoteEncode(f) ++ remoteEncode(a) ++ remoteEncode(b) ++ remoteEncode(c)
       case Ap4(f,a,b,c,d) => Process.emit(C.uint8.encode(5)) ++
         remoteEncode(f) ++ remoteEncode(a) ++ remoteEncode(b) ++ remoteEncode(c) ++ remoteEncode(d)
-      case LocalStream(stream,encoder, tag) => Process.emit(C.uint8.encode(6)) ++
+      case LocalStream(stream,encoder, tag) =>
+        Process.emit(C.uint8.encode(6)) ++
+        Process.repeat(Process.emit(C.bool.encode(true))) interleave
         stream.map(elem => encoder.map(_.encode(elem)).getOrElse(
           left(Err("cannot encode Local value with undefined encoder"))
-        ))
+        )) ++
+        Process.emit(C.bool.encode(false))
     }
 
   private val E = Monad[Decoder]
+
+  val localRemoteEncoder = new Encoder[Local[Any]] {
+    def encode(a: Local[Any]): Err \/ BitVector =
+      a.format.map(encoder => utf8.encode(a.tag) <+> encoder.encode(a.a))
+        .getOrElse(left(Err("cannot encode Local value with undefined encoder")))
+  }
+
+  def localRemoteDecoder(env: Codecs): Decoder[Local[Any]] =
+    utf8.flatMap( formatType =>
+      env.codecs.get(formatType).map{ codec => codec.map { a => Local(a,None,formatType) } }
+        .getOrElse(fail(Err(s"[decoding] unknown format type: $formatType")))
+    )
+
+  val refCodec: Codec[Ref[Any]] = utf8.as[Ref[Any]]
 
   /**
    * A `Remote[Any]` decoder. If a `Local` value refers
    * to a decoder that is not found in `env`, decoding fails
    * with an error.
    */
-  def remoteDecoder(env: Codecs): Decoder[Remote[Any]] = {
-    def go = remoteDecoder(env)
-    C.uint8.flatMap {
-      case 0 =>
-        utf8.flatMap { fmt =>
-                    env.codecs.get(fmt) match {
-                      case None => fail(Err(s"[decoding] unknown format type: $fmt"))
-                      case Some(dec) => dec.map { a => Local(a,None,fmt) }
-                    }
-                  }
-      case 1 =>
-        utf8.map(Ref.apply)
-      case 2 => E.apply2(go,go)((f,a) =>
-                  Ap1(f.asInstanceOf[Remote[Any => Any]],a))
-      case 3 => E.apply3(go,go,go)((f,a,b) =>
-                  Ap2(f.asInstanceOf[Remote[(Any,Any) => Any]],a,b))
-      case 4 => E.apply4(go,go,go,go)((f,a,b,c) =>
-                  Ap3(f.asInstanceOf[Remote[(Any,Any,Any) => Any]],a,b,c))
-      case 5 => E.apply5(go,go,go,go,go)((f,a,b,c,d) =>
-                  Ap4(f.asInstanceOf[Remote[(Any,Any,Any,Any) => Any]],a,b,c,d))
-      case t => fail(Err(s"[decoding] unknown tag byte: $t"))
+//  def remoteDecode(env: Codecs)(p: Process[Task, BitVector]): Task[Remote[Any]] = {
+//    def go = remoteDecode(env)
+//    p.head.flatMap { bits =>
+//      C.uint8.decode(bits).flatMap{
+//        case (bits, 0) =>
+//          p.tail.head.map { bits =>
+//            utf8.decode(bits).map { case (bits, fmt) =>
+//              env.codecs.get(fmt) match {
+//                case None => Task.fail(new DecodingFailure(Err(s"[decoding] unknown format type: $fmt")))
+//                case Some(dec) => dec.decode(bits).map { case (bits, a) =>
+//                  if (bits.nonEmpty) Task.now(Local(a, None, fmt))
+//                  // TODO: Improve exception
+//                  else Task.fail(new Exception("trailing bits"))
+//                }.toTask(new DecodingFailure(_))
+//              }
+//            }.toTask(new DecodingFailure(_))
+//          }
+//        case (bits,1) => ???
+//          //utf8.map(Ref.apply)
+//        case (bits,2) => ??? //E.apply2(go,go)((f,a) =>
+//                    //Ap1(f.asInstanceOf[Remote[Any => Any]],a))
+//        case (bits,3) => ??? //E.apply3(go,go,go)((f,a,b) =>
+//                    //Ap2(f.asInstanceOf[Remote[(Any,Any) => Any]],a,b))
+//        case (bits,4) => ??? //E.apply4(go,go,go,go)((f,a,b,c) =>
+//                    //Ap3(f.asInstanceOf[Remote[(Any,Any,Any) => Any]],a,b,c))
+//        case (bits,5) => ??? //E.apply5(go,go,go,go,go)((f,a,b,c,d) => ???
+//                    //Ap4(f.asInstanceOf[Remote[(Any,Any,Any,Any) => Any]],a,b,c,d))
+//        case (bits,t) => Task.fail(new DecodingFailure(Err(s"[decoding] unknown tag byte: $t")))
+//    }.toTask(new DecodingFailure(_))
+//  }
+
+  /**
+   * A `Remote[Any]` decoder. If a `Local` value refers
+   * to a decoder that is not found in `env`, decoding fails
+   * with an error.
+   */
+  def remoteDecode(env: Codecs)(p: Process[Task, BitVector]): Task[Remote[Any]] = {
+    // This instance should never truly be used but it necessary because of a shortcoming
+    // of for-comprehensions where a pattern match leads to a call to filter even if the pattern
+    // match is total
+//    implicit val notReallyUsedMonoid = new Monoid[Err] {
+//      def append(one: Err, two: Err): Err = throw new AssertionError
+//      def zero = throw new AssertionError
+//    }
+    implicit class TaskWithFilter[A](a: Task[A]) {
+      def withFilter(p: A => Boolean) = a
     }
+    //def go = remoteDecode(env)
+    (for {
+      bits <- p.head
+      (_, choice) <- C.uint8.complete.decode(bits).toTask
+    } yield {
+      choice match {
+        case 0 => for {
+          bits <- p.tail.head
+          (_, local) <- localRemoteDecoder(env).complete.decode(bits).toTask
+        } yield local
+        case 1 => for {
+          bits <- p.tail.head
+          (_, ref) <- refCodec.complete.decode(bits).toTask
+        } yield ref
+        case 2 =>
+      }
+    }).flatten
   }
 
   /**
@@ -191,7 +248,7 @@ package object codecs extends lowerprioritycodecs with TupleHelpers {
    * Use `encode(r).map(_.toByteArray)` to produce a `Task[Array[Byte]]`.
    */
   def encodeRequest[A:TypeTag](a: Remote[A]): Response[BitVector] = Response { ctx =>
-    Process.emit(Codec[String].encode(Remote.toTag[A]) <+>
+    Process.emit(utf8.encode(Remote.toTag[A]) <+>
     Encoder[Response.Context].encode(ctx) <+>
     sortedSet[String].encode(formats(a))) ++
     remoteEncode(a) flatMap {
@@ -200,8 +257,63 @@ package object codecs extends lowerprioritycodecs with TupleHelpers {
     }
   }
 
+  def decodeRequest(env: Environment)(req: Process[Task, BitVector]): Task[(Encoder[Any],Response.Context,Process[Task, Any])] = {
+    val headerBits = req.head
+    val headerDecoder = for {
+      responseTag <- utf8
+      ctx <- Decoder[Response.Context]
+      formatTags <- sortedSet[String]
+    } yield (responseTag, ctx, formatTags)
+    val headerAndRest = headerBits.flatMap { h =>
+      val header = headerDecoder.decode(h)
+      header match {
+        case -\/(e) => Task.fail(new DecodingFailure(e))
+        case \/-(a) => Task.now(a)
+      }
+    }
+    val header = headerAndRest.flatMap { case (trailing, stuff) =>
+      // TODO: Use a better exception than Exception
+      if (trailing.nonEmpty) Task.fail(new Exception("trailing bits were found..."))
+      else Task.now(stuff)
+    }
+
+    val closer = header.flatMap { case (responseTag,ctx, tags) =>
+      env.codecs.get(responseTag) match {
+      case None => Task.fail(new DecodingFailure(Err(s"[decoding] server does not have response serializer for: $responseTag")))
+      case Some(a) => Task.now((responseTag, a, ctx, tags,req.tail))
+    }
+    }
+
+    val closererer = closer.flatMap { case (responseTag, encoder, ctx, tags, p) =>
+        val unknown = ((tags + responseTag) -- env.codecs.keySet).toList
+        if (unknown.isEmpty) Task.now((encoder, ctx, p))
+        else {
+          val unknownMsg = unknown.mkString("\n")
+          Task.fail(new DecodingFailure(Err(s"[decoding] server does not have deserializers for:\n$unknownMsg")))
+        }
+    }
+    closererer
+
+//    for {
+//      responseTag <- utf8
+//      ctx <- Decoder[Response.Context]
+//      formatTags <- sortedSet[String]
+//      r <- {
+//        val unknown = ((formatTags + responseTag) -- env.codecs.keySet).toList
+//        if (unknown.isEmpty) remoteDecoder(env.codecs)
+//        else {
+//          val unknownMsg = unknown.mkString("\n")
+//          fail(Err(s"[decoding] server does not have deserializers for:\n$unknownMsg"))
+//        }
+//      }
+//      responseDec <- env.codecs.get(responseTag) match {
+//        case None => fail(Err(s"[decoding] server does not have response serializer for: $responseTag"))
+//        case Some(a) => succeed(a)
+//      }
+//    } yield (responseDec, ctx, r)
+  }
+
   def decodeResponse[A: Decoder](resp: Process[Task, BitVector]): Process[Task, String \/ A] = {
-    import remotely.utils._
     val rawDecoded: Process[Task, Err \/ (BitVector, String \/ A)] = resp.map(bits=> responseDecoder[A].decode(bits))
     val decodedWithFail = rawDecoded.map(failOnClientDecodeProblem(_))
     decodedWithFail.flatten
@@ -212,25 +324,6 @@ package object codecs extends lowerprioritycodecs with TupleHelpers {
       response1 <- failOnClientDecodeErr(response)
       response2 <- failOnTrailingBits(response1)
     } yield response2
-
-  def requestDecoder(env: Environment): Decoder[(Encoder[Any],Response.Context,Remote[Any])] =
-    for {
-      responseTag <- utf8
-      ctx <- Decoder[Response.Context]
-      formatTags <- sortedSet[String]
-      r <- {
-        val unknown = ((formatTags + responseTag) -- env.codecs.keySet).toList
-        if (unknown.isEmpty) remoteDecoder(env.codecs)
-        else {
-          val unknownMsg = unknown.mkString("\n")
-          fail(Err(s"[decoding] server does not have deserializers for:\n$unknownMsg"))
-        }
-      }
-      responseDec <- env.codecs.get(responseTag) match {
-        case None => fail(Err(s"[decoding] server does not have response serializer for: $responseTag"))
-        case Some(a) => succeed(a)
-      }
-    } yield (responseDec, ctx, r)
 
   def responseDecoder[A:Decoder]: Decoder[String \/ A] = bool flatMap {
     case false => utf8.map(left)
